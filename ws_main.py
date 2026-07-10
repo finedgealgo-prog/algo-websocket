@@ -52,10 +52,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from features.broker_gateway import broker_ticker_manager as ticker_manager
 from features.live_quote_socket import live_quote_socket_router
-from features.live_greeks_chain_socket import live_greeks_chain_socket_router
-from features.fno_stocks import router as fno_stocks_router
-from features.historical_data_router import router as historical_data_router
-from features.mcx_commodities import router as mcx_commodities_router
+from live_greeks_chain_socket import live_greeks_chain_socket_router
+from fno_stocks import router as fno_stocks_router
+from historical_data_router import router as historical_data_router
+from mcx_commodities import router as mcx_commodities_router
 from features.mongo_data import MongoData
 
 log = logging.getLogger(__name__)

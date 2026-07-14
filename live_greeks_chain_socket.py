@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -50,6 +51,48 @@ IST = timezone(timedelta(hours=5, minutes=30))
 PUSH_INTERVAL_SECONDS = 2.0   # matches live_option_chain.py's _CHAIN_TTL_SECONDS
 
 _LOT_SIZE_DEFAULTS = {'NIFTY': 75, 'BANKNIFTY': 15, 'FINNIFTY': 40, 'MIDCPNIFTY': 120, 'SENSEX': 10, 'BANKEX': 15}
+
+# Per-process "already kicked off" set — first request for ANY expiry of an
+# underlying triggers a background warm of every OTHER expiry's chain too, so
+# a user clicking through expiry tabs (weekly → next-weekly → monthly, ...)
+# never hits a cold WS subscription one tab at a time. Without this, only
+# whichever expiry happens to be actively/repeatedly requested stays warm;
+# everything else always starts from ltp=0 and takes a few seconds to catch
+# up (see get_broker_rest_quotes' _has_never_seen fast-path for the other
+# half of this fix — REST no longer silently skips a never-seen token just
+# because another caller held the shared Dhan rate-gate slot).
+_warm_lock = threading.Lock()
+_warmed_underlyings: set[str] = set()
+
+
+def _ensure_all_expiries_warm(db_raw, underlying: str, expiries: list[str]) -> None:
+    from features.broker_gateway import _active_broker  # type: ignore
+    if _active_broker() != 'dhan':
+        return   # Kite path REST-fetches the whole chain per-request anyway — no warm needed.
+    with _warm_lock:
+        if underlying in _warmed_underlyings:
+            return
+        _warmed_underlyings.add(underlying)
+
+    def _run() -> None:
+        from features.broker_gateway import broker_ticker_manager  # type: ignore
+        for exp in expiries:
+            try:
+                docs = list(db_raw['active_option_tokens'].find(
+                    {'broker': 'dhan', 'instrument': underlying, 'expiry': {'$regex': f'^{exp}'}},
+                    {'_id': 0, 'token': 1, 'tokens': 1, 'ws_segment': 1},
+                ))
+                by_segment: dict[str, list[str]] = {}
+                for d in docs:
+                    tok = str(d.get('token') or d.get('tokens') or '').strip()
+                    if tok:
+                        by_segment.setdefault(str(d.get('ws_segment') or 'NSE_FNO'), []).append(tok)
+                for segment, ids in by_segment.items():
+                    broker_ticker_manager.warm_chain_tokens(ids, segment)
+            except Exception as exc:
+                log.warning('[GreeksChainHub] warm-all-expiries error underlying=%s expiry=%s: %s', underlying, exp, exc)
+
+    threading.Thread(target=_run, daemon=True, name=f'warm_all_expiries_{underlying}').start()
 
 
 def _resolve_expiries(db, underlying: str) -> list[str]:
@@ -100,7 +143,28 @@ def _resolve_spot_price(db, underlying: str, expiry: str) -> float:
 
 
 def _resolve_previous_close(db, underlying: str) -> float:
-    """Yesterday's actual close — NOT pricing_spot (see _build_chain_payload)."""
+    """Yesterday's actual close — NOT pricing_spot (see _build_chain_payload).
+
+    Prefers Dhan's own RESP_PREV_CLOSE WS packet (dhan_ticker.py's
+    prev_close_map) — same fix already applied to execution_socket.py's
+    _fetch_dhan_index_quotes(); this file had its own separate, unpatched
+    copy of the same "previous close" concept, sourced only from Mongo.
+    Falls back to the Mongo lookup while that map is still warming up.
+    """
+    try:
+        from features.dhan_ticker import _load_dhan_spot_tokens
+        from features.broker_gateway import broker_ticker_manager as _tm_glc
+        spot_tokens, vix_token = _load_dhan_spot_tokens(db)
+        token = vix_token if underlying == 'INDIAVIX' else next(
+            (tok for tok, u in spot_tokens.items() if u == underlying), None,
+        )
+        if token:
+            mapped = float(_tm_glc.prev_close_map.get(str(token)) or 0)
+            if mapped > 0:
+                return mapped
+    except Exception:
+        pass
+
     today = datetime.now(IST).strftime('%Y-%m-%d')
     day_start = f'{today}T00:00:00'
     doc = db['option_chain_index_spot'].find_one(
@@ -156,6 +220,7 @@ def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
     from features.broker_gateway import get_active_broker_token_status  # type: ignore
 
     expiries = _resolve_expiries(db._db, underlying)
+    _ensure_all_expiries_warm(db._db, underlying, expiries)
     resolved_expiry = expiry or (expiries[0] if expiries else '')
     spot_price = _resolve_spot_price(db._db, underlying, resolved_expiry)
     chain = (

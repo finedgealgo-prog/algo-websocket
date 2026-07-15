@@ -142,15 +142,32 @@ def _resolve_spot_price(db, underlying: str, expiry: str) -> float:
     return 0.0
 
 
+# underlying -> (day, prev_close) resolved the FIRST time this session. Without
+# this, _resolve_previous_close re-picks its source on every single call (every
+# REST hit + every WS chain push): Dhan's live prev_close_map when present, else
+# the Mongo lookup — and those two don't always agree to the last rupee, so
+# change_pct/change_points flickered between two close-but-different numbers
+# depending on which source happened to win that call. Same fix as
+# execution_socket.py's _fetch_dhan_index_quotes() (_STABLE_PREV_CLOSE there) —
+# see the module comment above about this file having a separate, unpatched copy.
+_STABLE_PREV_CLOSE: dict[str, tuple[str, float]] = {}
+
+
 def _resolve_previous_close(db, underlying: str) -> float:
     """Yesterday's actual close — NOT pricing_spot (see _build_chain_payload).
 
     Prefers Dhan's own RESP_PREV_CLOSE WS packet (dhan_ticker.py's
-    prev_close_map) — same fix already applied to execution_socket.py's
-    _fetch_dhan_index_quotes(); this file had its own separate, unpatched
-    copy of the same "previous close" concept, sourced only from Mongo.
-    Falls back to the Mongo lookup while that map is still warming up.
+    prev_close_map), falling back to the Mongo lookup while that map is still
+    warming up — then locks whichever value resolved first in place for the
+    rest of the trading day (see _STABLE_PREV_CLOSE above) so it can't flicker
+    between the two sources on subsequent calls.
     """
+    today = datetime.now(IST).strftime('%Y-%m-%d')
+    cached = _STABLE_PREV_CLOSE.get(underlying)
+    if cached is not None and cached[0] == today and cached[1] > 0:
+        return cached[1]
+
+    resolved = 0.0
     try:
         from features.dhan_ticker import _load_dhan_spot_tokens
         from features.broker_gateway import broker_ticker_manager as _tm_glc
@@ -159,20 +176,22 @@ def _resolve_previous_close(db, underlying: str) -> float:
             (tok for tok, u in spot_tokens.items() if u == underlying), None,
         )
         if token:
-            mapped = float(_tm_glc.prev_close_map.get(str(token)) or 0)
-            if mapped > 0:
-                return mapped
+            resolved = float(_tm_glc.prev_close_map.get(str(token)) or 0)
     except Exception:
         pass
 
-    today = datetime.now(IST).strftime('%Y-%m-%d')
-    day_start = f'{today}T00:00:00'
-    doc = db['option_chain_index_spot'].find_one(
-        {'underlying': underlying, 'timestamp': {'$lt': day_start}},
-        {'_id': 0, 'close': 1, 'spot_price': 1},
-        sort=[('timestamp', -1)],
-    ) or {}
-    return float(doc.get('spot_price') or doc.get('close') or 0)
+    if resolved <= 0:
+        day_start = f'{today}T00:00:00'
+        doc = db['option_chain_index_spot'].find_one(
+            {'underlying': underlying, 'timestamp': {'$lt': day_start}},
+            {'_id': 0, 'close': 1, 'spot_price': 1},
+            sort=[('timestamp', -1)],
+        ) or {}
+        resolved = float(doc.get('spot_price') or doc.get('close') or 0)
+
+    if resolved > 0:
+        _STABLE_PREV_CLOSE[underlying] = (today, resolved)
+    return resolved
 
 
 def _resolve_india_vix(db) -> float:

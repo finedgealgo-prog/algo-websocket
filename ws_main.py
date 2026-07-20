@@ -52,7 +52,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from features.broker_gateway import broker_ticker_manager as ticker_manager
 from features.live_quote_socket import live_quote_socket_router
-from live_greeks_chain_socket import live_greeks_chain_socket_router
+from live_greeks_chain_socket import live_greeks_chain_socket_router, prewarm_chain_rest
 from fno_stocks import router as fno_stocks_router
 from historical_data_router import router as historical_data_router
 from mcx_commodities import router as mcx_commodities_router
@@ -212,6 +212,46 @@ async def _auto_start_ticker() -> None:
                 log.info("[STARTUP] Broker ticker auto-started.")
         except Exception:
             log.exception("[STARTUP] Broker ticker auto-start failed.")
+    asyncio.create_task(_bg())
+
+
+@app.on_event("startup")
+async def _auto_prewarm_chain_rest() -> None:
+    """
+    Pays the first /live-greeks-chain request's REST cost (Dhan quotes+depth
+    round trip + Mongo baseline aggregation, ~0.6-1.4s cold) during server
+    boot instead of on whichever user loads the page first — see
+    prewarm_chain_rest's docstring. Reuses the same admin-configured
+    algo_subscribe_index list _prewarm_index_chains (dhan_ticker.py) already
+    warms the WS subscription for; empty config (nothing saved in the Prewarm
+    Config admin page) means this is a no-op, same as that WS warm already is.
+
+    15s delay — longer than _auto_start_ticker's 2s — so the broker WS
+    connection this depends on (spot_map / ltp_map starting to fill) has had
+    a real chance to come up first; firing before that would still work (REST
+    doesn't need WS to be ready) but wastes the one background attempt racing
+    a connection that isn't there yet.
+    """
+    async def _bg():
+        await asyncio.sleep(15)
+        try:
+            db = MongoData()
+            try:
+                instruments = await asyncio.to_thread(_get_prewarm_config, db._db)
+            finally:
+                db.close()
+            if not instruments:
+                log.info("[STARTUP] Chain REST prewarm skipped — no instruments configured in algo_subscribe_index.")
+                return
+            threading.Thread(
+                target=prewarm_chain_rest,
+                args=(instruments,),
+                daemon=True,
+                name="chain_rest_prewarm",
+            ).start()
+            log.info("[STARTUP] Chain REST prewarm started for %s", instruments)
+        except Exception:
+            log.exception("[STARTUP] Chain REST prewarm failed.")
     asyncio.create_task(_bg())
 
 
@@ -404,12 +444,20 @@ async def save_prewarm_config(body: dict = Body(...)) -> dict:
 
 
 def _warm_instruments_now(db, instruments: list[str]) -> None:
-    """Immediately warm all expiries for the given instruments on the chain-feed pool."""
+    """Immediately warm all expiries for the given instruments on the chain-feed pool
+    (WS subscribe), then the REST quotes+depth+baseline cost too (see
+    prewarm_chain_rest) — so saving config in the admin page warms both right
+    away instead of only the WS half, with the REST half waiting for next
+    restart's _auto_prewarm_chain_rest."""
     try:
         from features.dhan_ticker import dhan_ticker_manager  # type: ignore
         dhan_ticker_manager._prewarm_index_chains(db, instruments)
     except Exception as exc:
         log.warning("[prewarm-config] immediate warm error: %s", exc)
+    try:
+        prewarm_chain_rest(instruments)
+    except Exception as exc:
+        log.warning("[prewarm-config] immediate REST prewarm error: %s", exc)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

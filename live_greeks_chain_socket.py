@@ -280,6 +280,43 @@ def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
     }
 
 
+def prewarm_chain_rest(underlyings: list[str]) -> None:
+    """
+    Runs the exact same _build_chain_payload() a real /live-greeks-chain
+    request would, for each underlying's nearest expiry, at server startup
+    (see ws_main.py) instead of waiting for the first real user to pay for it.
+
+    _prewarm_index_chains (dhan_ticker.py) already warms the WS *subscription*
+    for these underlyings at ticker start — that gets LTP flowing into
+    ltp_map, but does nothing for the one-time Mongo baseline aggregation
+    (_resolve_previous_day_baseline, ~50ms first call, then 5-min cached) or
+    the Dhan REST quotes+depth round trip (get_broker_rest_quotes /
+    get_broker_rest_depth, ~0.6-1.4s cold — see the option-chain latency
+    investigation this completes) that a genuinely first-ever request for
+    that chain still has to pay for. Running it here means that cost lands
+    during server boot, in the background, instead of on whichever user
+    happens to load the page first.
+
+    Sequential, not parallel — every REST call in here still goes through the
+    same shared Dhan rate gate (broker_gateway.py's dhan_quote_post_blocking)
+    every other caller in the app uses, so firing N underlyings at once would
+    just make each other wait instead of actually running any faster, and
+    risks tripping Dhan's real rate limit at exactly the moment the server
+    boots. One at a time is the same total background time either way.
+    """
+    from features.mongo_data import MongoData  # type: ignore
+
+    for underlying in underlyings:
+        db = MongoData()
+        try:
+            _build_chain_payload(db, underlying, '')
+            log.info('[GreeksChainPrewarm] warmed %s', underlying)
+        except Exception as exc:
+            log.warning('[GreeksChainPrewarm] %s failed: %s', underlying, exc)
+        finally:
+            db.close()
+
+
 class _GreeksChainHub:
     """
     Per-(underlying, expiry) broadcaster: one background task computes and

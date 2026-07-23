@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -238,27 +239,48 @@ def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
     from features.live_option_chain import fetch_full_chain  # type: ignore
     from features.broker_gateway import get_active_broker_token_status  # type: ignore
 
+    # [CHAIN-TIMING] Step-by-step wall-clock breakdown — request to debug where
+    # /live-greeks-chain/{instrument} spends its time. Remove once the slow step
+    # is identified and fixed; this is diagnostic-only instrumentation.
+    _t_start = time.perf_counter()
+    _tag = f'{underlying}|{expiry or "-"}'
+
+    def _lap(label: str, _t_prev: list[float] = [_t_start]) -> None:
+        now = time.perf_counter()
+        print(f'[CHAIN-TIMING] {_tag} {label}: {(now - _t_prev[0]) * 1000:.1f}ms', flush=True)
+        _t_prev[0] = now
+
     expiries = _resolve_expiries(db._db, underlying)
+    _lap('resolve_expiries')
     _ensure_all_expiries_warm(db._db, underlying, expiries)
+    _lap('ensure_all_expiries_warm (spawn only, real work is async)')
     resolved_expiry = expiry or (expiries[0] if expiries else '')
     spot_price = _resolve_spot_price(db._db, underlying, resolved_expiry)
+    _lap('resolve_spot_price')
     chain = (
         fetch_full_chain(db, underlying, resolved_expiry, spot_price)
         if resolved_expiry else {'CE': [], 'PE': []}
     )
+    _lap('fetch_full_chain (see [CHAIN-TIMING] sub-steps below for its own breakdown)')
 
     previous_close = _resolve_previous_close(db._db, underlying)
     change_pct = round((spot_price - previous_close) / previous_close * 100, 2) if previous_close else 0.0
     change_points = round(spot_price - previous_close, 2) if previous_close else 0.0
+    _lap('resolve_previous_close')
     india_vix = _resolve_india_vix(db._db)
+    _lap('resolve_india_vix')
     lot_size = _resolve_lot_size(db._db, underlying, resolved_expiry) if resolved_expiry else _LOT_SIZE_DEFAULTS.get(underlying, 75)
+    _lap('resolve_lot_size')
     atm_strike, strike_interval = _compute_atm_and_interval(chain, spot_price)
+    _lap('compute_atm_and_interval')
 
     token_ok, token_msg = True, ''
     try:
         token_ok, token_msg = get_active_broker_token_status()
     except Exception:
         pass
+    _lap('get_active_broker_token_status')
+    print(f'[CHAIN-TIMING] {_tag} TOTAL: {(time.perf_counter() - _t_start) * 1000:.1f}ms', flush=True)
 
     return {
         'type':                  'chain',

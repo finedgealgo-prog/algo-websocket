@@ -1,0 +1,15 @@
+[Unit]
+Description=Algo Websocket Gateway instance on port %i (browser connections only — no broker connection)
+After=network.target algo-websocket.service
+Requires=algo-websocket.service
+
+[Service]
+User=ec2-user
+WorkingDirectory=/app/algo-backend/algo.websocket
+Environment=WS_GATEWAY_ONLY=true
+Environment=WS_PRIMARY_HUB_URL=http://127.0.0.1:8003
+ExecStart=/app/algo-backend/algo.websocket/venv/bin/python -m uvicorn ws_main:app --host 127.0.0.1 --port %i
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

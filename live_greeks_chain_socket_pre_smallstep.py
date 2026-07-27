@@ -51,14 +51,6 @@ live_greeks_chain_socket_router = APIRouter()
 IST = timezone(timedelta(hours=5, minutes=30))
 PUSH_INTERVAL_SECONDS = 2.0   # matches live_option_chain.py's _CHAIN_TTL_SECONDS
 
-# Strikes kept each side of ATM per CE/PE for the live UI chain. fetch_full_
-# chain's strike_window param exists exactly for this (see its docstring) but
-# was never actually passed from here — every UI chain request fetched every
-# strike in the expiry, which is the main reason a cold/far-month expiry took
-# seconds instead of <500ms. A user looking at the table sees ~20-30 strikes
-# around spot at a time, so windowing here costs nothing visible.
-UI_CHAIN_STRIKE_WINDOW = 30
-
 _LOT_SIZE_DEFAULTS = {'NIFTY': 75, 'BANKNIFTY': 15, 'FINNIFTY': 40, 'MIDCPNIFTY': 120, 'SENSEX': 10, 'BANKEX': 15}
 
 # Per-process "already kicked off" set — first request for ANY expiry of an
@@ -252,7 +244,7 @@ def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
     resolved_expiry = expiry or (expiries[0] if expiries else '')
     spot_price = _resolve_spot_price(db._db, underlying, resolved_expiry)
     chain = (
-        fetch_full_chain(db, underlying, resolved_expiry, spot_price, strike_window=UI_CHAIN_STRIKE_WINDOW)
+        fetch_full_chain(db, underlying, resolved_expiry, spot_price)
         if resolved_expiry else {'CE': [], 'PE': []}
     )
 
@@ -463,54 +455,6 @@ async def live_greeks_chain_socket(
     finally:
         await _hub.unregister(key, websocket)
         log.info('[live-greeks-chain] disconnected instrument=%s expiry=%s', underlying, expiry or '-')
-
-
-@live_greeks_chain_socket_router.websocket('/ws/live-greeks-chain')
-async def live_greeks_chain_socket_multi(websocket: WebSocket) -> None:
-    """
-    Multiplexed sibling of /ws/live-greeks-chain/{instrument} above — one
-    connection, many (instrument, expiry) pairs, added/dropped via
-    {action:"subscribe"|"unsubscribe", instrument, expiry} messages instead of
-    one connection per pair. Matches what the frontend's useLiveChainSocket.ts
-    (useLiveChainSocketMulti) has always sent — the mismatch with the old
-    single-instrument-in-path-only endpoint (which silently ignored message
-    bodies) is why the frontend kept its WS disabled. Reuses the same
-    _GreeksChainHub — this is a different ingress onto it, not a second push
-    mechanism.
-    """
-    await websocket.accept()
-    held: set[tuple[str, str]] = set()
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            action = str(msg.get('action') or '').strip().lower()
-            underlying = str(msg.get('instrument') or '').strip().upper()
-            expiry = str(msg.get('expiry') or '').strip()
-            if not underlying:
-                continue
-            key = (underlying, expiry)
-            if action == 'subscribe':
-                if key not in held:
-                    held.add(key)
-                    await _hub.register(key, websocket)
-            elif action == 'unsubscribe':
-                if key in held:
-                    held.discard(key)
-                    await _hub.unregister(key, websocket)
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        for key in list(held):
-            try:
-                await _hub.unregister(key, websocket)
-            except Exception:
-                pass
 
 
 @live_greeks_chain_socket_router.get('/live-greeks-chain/{instrument}')

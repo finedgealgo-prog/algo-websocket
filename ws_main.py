@@ -44,6 +44,7 @@ Run (from /media/ashok-innoppl/7CD60970D6092C48/algo-backend/algo.websocket):
 import asyncio
 import json
 import logging
+import os
 import threading
 import uuid
 
@@ -84,6 +85,27 @@ app.include_router(historical_data_router)
 _app_loop: asyncio.AbstractEventLoop | None = None
 
 
+# Phase 3 groundwork (see /home/ashok-innoppl/.claude/plans/crystalline-
+# moseying-hoare.md) — this channel is published to on every tick below
+# regardless of whether any internal client is connected, so a future
+# horizontally-scaled gateway tier (separate live_quote_socket.py processes,
+# possibly on other machines, each holding a slice of the browser
+# connections) can subscribe here instead of needing a direct WS to this one
+# process. Inert today — nothing subscribes to it yet, this process still
+# does the local in-process broadcast below exactly as before.
+REDIS_TICK_CHANNEL = "algo:ticks"
+
+_redis_pub_client = None
+
+
+async def _get_redis_pub_client():
+    global _redis_pub_client
+    if _redis_pub_client is None:
+        import redis.asyncio as aioredis
+        _redis_pub_client = aioredis.Redis(host="localhost", port=6379, db=0)
+    return _redis_pub_client
+
+
 class _InternalTickHub:
     """
     Broadcasts broker tick payloads to all connected internal service clients
@@ -107,10 +129,9 @@ class _InternalTickHub:
         log.info("[InternalHub] service disconnected id=%s remaining=%d", client_id, len(self._clients))
 
     async def broadcast(self, tick_payload: dict) -> None:
-        """Broadcast a broker tick payload to all connected services."""
-        if not self._clients:
-            return
-
+        """Broadcast a broker tick payload to all connected services, and
+        publish the same payload to Redis (see REDIS_TICK_CHANNEL) for any
+        future horizontally-scaled gateway process to consume."""
         changed_ltp: dict = tick_payload.get("changed_ltp_map") or {}
         spot_map:    dict = tick_payload.get("spot_map")         or {}
         if not changed_ltp:
@@ -134,6 +155,16 @@ class _InternalTickHub:
                 "now_ts": (tick_payload.get("timestamp") or "")[:19],
             },
         })
+
+        try:
+            redis_client = await _get_redis_pub_client()
+            await redis_client.publish(REDIS_TICK_CHANNEL, msg)
+        except Exception as exc:
+            # Never let a Redis hiccup break the existing local broadcast path below.
+            log.debug("[InternalHub] redis publish skipped: %s", exc)
+
+        if not self._clients:
+            return
 
         async with self._lock:
             clients = list(self._clients.items())
@@ -164,8 +195,15 @@ def _on_broker_tick(tick_payload: dict) -> None:
     Registered as a tick listener on the broker ticker.
     Runs in the broker's background thread — schedule the async broadcast
     onto the FastAPI event loop without blocking the tick callback.
+
+    Previously short-circuited when no legacy internal-hub WS client was
+    connected — harmless when broadcast() only ever did local WS fanout, but
+    it also skipped the Redis publish below now that broadcast() does that
+    unconditionally (see REDIS_TICK_CHANNEL), which would make Redis-only
+    consumers (a future gateway process with no /ws/internal-ticks client at
+    all) never receive anything.
     """
-    if _app_loop is None or not _internal_hub._clients:
+    if _app_loop is None:
         return
     try:
         asyncio.run_coroutine_threadsafe(
@@ -202,8 +240,33 @@ async def _capture_loop() -> None:
     _app_loop = asyncio.get_running_loop()
 
 
+# Phase 3 horizontal scale-out: a second (third, fourth, ...) ws_main
+# instance meant to hold browser /ws/live-quotes connections must NOT also
+# open its own Dhan/Kite WS connection — Dhan allows only 5 total, and the
+# whole point of the central-tick design (see central_tick_client.py) is
+# exactly one process owns that connection. Set WS_GATEWAY_ONLY=true to skip
+# owning the broker connection and instead become a CentralTickClient of the
+# primary instance — the same mechanism algo.trade/algo.simulator already
+# use, reused here rather than inventing a second one. Unset (the default)
+# preserves today's single-instance behavior exactly.
+WS_GATEWAY_ONLY = os.getenv("WS_GATEWAY_ONLY", "").strip().lower() in ("1", "true", "yes")
+WS_PRIMARY_HUB_URL = os.getenv("WS_PRIMARY_HUB_URL", "http://localhost:8003")
+
+
 @app.on_event("startup")
 async def _auto_start_ticker() -> None:
+    if WS_GATEWAY_ONLY:
+        from features.central_tick_client import CentralTickClient
+        client = CentralTickClient(WS_PRIMARY_HUB_URL)
+        ticker_manager.set_central_client(client)
+        db = MongoData()
+        try:
+            client.start(db)
+        finally:
+            db.close()
+        log.info("[STARTUP] Gateway-only mode — central-tick client started against %s", WS_PRIMARY_HUB_URL)
+        return
+
     async def _bg():
         await asyncio.sleep(2)
         try:

@@ -54,7 +54,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from features.broker_gateway import broker_ticker_manager as ticker_manager
 from features.live_quote_socket import live_quote_socket_router
 from live_greeks_chain_socket import live_greeks_chain_socket_router, prewarm_chain_rest
-from fno_stocks import router as fno_stocks_router
+from fno_stocks import router as fno_stocks_router, _refresh_fno_cache
 from historical_data_router import router as historical_data_router
 from mcx_commodities import router as mcx_commodities_router
 from features.mongo_data import MongoData
@@ -315,6 +315,24 @@ async def _auto_prewarm_chain_rest() -> None:
             log.info("[STARTUP] Chain REST prewarm started for %s", instruments)
         except Exception:
             log.exception("[STARTUP] Chain REST prewarm failed.")
+    asyncio.create_task(_bg())
+
+
+@app.on_event("startup")
+async def _auto_prewarm_fno_stocks() -> None:
+    """
+    Runs the /fno-stocks aggregation once at boot instead of on whichever
+    request happens to hit a cold (post-restart) cache — see
+    fno_stocks._refresh_fno_cache's docstring on why that cold path, run
+    inline on a request, is slow and blocks this process's shared event loop
+    (the same loop /ws/internal-ticks depends on).
+    """
+    async def _bg():
+        try:
+            stocks = await _refresh_fno_cache()
+            log.info("[STARTUP] FNO stocks cache prewarmed (%d symbols).", len(stocks))
+        except Exception:
+            log.exception("[STARTUP] FNO stocks prewarm failed.")
     asyncio.create_task(_bg())
 
 

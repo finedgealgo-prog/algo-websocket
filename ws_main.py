@@ -58,6 +58,7 @@ from fno_stocks import router as fno_stocks_router, _refresh_fno_cache
 from historical_data_router import router as historical_data_router
 from mcx_commodities import router as mcx_commodities_router
 from features.mongo_data import MongoData
+from features.market_hours_scheduler import run_market_hours_scheduler
 
 log = logging.getLogger(__name__)
 
@@ -279,6 +280,30 @@ async def _auto_start_ticker() -> None:
 
 
 @app.on_event("startup")
+async def _start_ticker_market_hours_schedule() -> None:
+    """
+    Auto-stop the broker WS connection after market close, auto-start it
+    again ~09:10 next weekday — see features/market_hours_scheduler.py.
+    Independent of _auto_start_ticker above (that one just brings the ticker
+    up once on process boot); this keeps it in sync with market hours every
+    day after that. /ticker/restart (start) and /ticker/stop (stop) remain
+    available as a manual override at any time, market hours or not.
+    """
+    if WS_GATEWAY_ONLY:
+        return  # gateway-only instances don't own a broker connection
+
+    async def _scheduled_start() -> None:
+        await asyncio.to_thread(_start_ticker_bg)
+
+    asyncio.create_task(run_market_hours_scheduler(
+        name="websocket-ticker",
+        start_fn=_scheduled_start,
+        stop_fn=ticker_manager.stop,
+        is_running_fn=lambda: ticker_manager.status == "running",
+    ))
+
+
+@app.on_event("startup")
 async def _auto_prewarm_chain_rest() -> None:
     """
     Pays the first /live-greeks-chain request's REST cost (Dhan quotes+depth
@@ -390,6 +415,19 @@ async def ticker_restart() -> dict:
     """
     await asyncio.to_thread(_start_ticker_bg)
     return {"ok": True, "message": "Ticker restart triggered", "ticker_status": ticker_manager.status}
+
+
+@app.api_route("/ticker/stop", methods=["GET", "POST"])
+async def ticker_stop() -> dict:
+    """
+    Manually stop the hub's single Dhan/Kite WS connection — the override
+    counterpart to /ticker/restart. Also used by the market-hours scheduler
+    (see _start_ticker_market_hours_schedule above) to close the connection
+    after market close; calling this by hand at any other time works the
+    same way and the 09:10 schedule will bring it back up next weekday.
+    """
+    await asyncio.to_thread(ticker_manager.stop)
+    return {"ok": True, "message": "Ticker stop triggered", "ticker_status": ticker_manager.status}
 
 
 @app.post("/ticker/warm-chain")

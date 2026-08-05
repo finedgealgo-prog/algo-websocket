@@ -52,12 +52,15 @@ IST = timezone(timedelta(hours=5, minutes=30))
 PUSH_INTERVAL_SECONDS = 2.0   # matches live_option_chain.py's _CHAIN_TTL_SECONDS
 
 # Strikes kept each side of ATM per CE/PE for the live UI chain. fetch_full_
-# chain's strike_window param exists exactly for this (see its docstring) but
-# was never actually passed from here — every UI chain request fetched every
-# strike in the expiry, which is the main reason a cold/far-month expiry took
-# seconds instead of <500ms. A user looking at the table sees ~20-30 strikes
-# around spot at a time, so windowing here costs nothing visible.
-UI_CHAIN_STRIKE_WINDOW = 30
+# chain's strike_window param exists exactly for this (see its docstring) —
+# 0 means "every strike" (fetch_full_chain's own default/unwindowed
+# behavior). Was 30 (ATM±30 per side) to keep a cold/far-month expiry fast,
+# but the Trading Terminal wishlist search needs every strike to show up in
+# results, and this constant is shared by every consumer of this chain
+# endpoint (LiveOptionChain.tsx included) — so unwindowed is now the default
+# everywhere, at the cost of a cold/wide expiry being slower to first-load
+# (see fetch_full_chain's docstring for the original tradeoff).
+UI_CHAIN_STRIKE_WINDOW = 0
 
 _LOT_SIZE_DEFAULTS = {'NIFTY': 75, 'BANKNIFTY': 15, 'FINNIFTY': 40, 'MIDCPNIFTY': 120, 'SENSEX': 10, 'BANKEX': 15}
 

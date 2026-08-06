@@ -589,3 +589,27 @@ async def health() -> dict:
         "ticker_status":    ticker_manager.status,
         "internal_clients": _internal_hub.get_status()["connected_services"],
     }
+
+
+@app.get("/debug/prev-close-status")
+async def debug_prev_close_status(underlying: str = "") -> dict:
+    """
+    Temporary diagnostic: is prev_close_map actually populated for a given
+    underlying's spot sec_id right now, and is that sec_id even registered
+    as a spot token at all? Answers "did Dhan ever send a RESP_PREV_CLOSE
+    packet for this token" directly instead of inferring it from an
+    endpoint response that also has DB/REST fallbacks layered on top.
+    """
+    from features.dhan_ticker import dhan_ticker_manager as _dtm  # type: ignore
+    ul = str(underlying or "").strip().upper()
+    active = dict(_dtm._active_spot_tokens)
+    sid = next((s for s, u in active.items() if u == ul), None) if ul else None
+    return {
+        "underlying":        ul,
+        "registered_sec_id": sid,
+        "prev_close_value":  _dtm.prev_close_map.get(sid) if sid else None,
+        "ltp_value":         _dtm.ltp_map.get(sid) if sid else None,
+        "spot_map_value":    _dtm.spot_map.get(ul),
+        "ticker_status":     _dtm.status,
+        "prev_close_map_total_entries": len(_dtm.prev_close_map),
+    }

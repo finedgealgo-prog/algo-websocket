@@ -103,7 +103,13 @@ async def _get_redis_pub_client():
     global _redis_pub_client
     if _redis_pub_client is None:
         import redis.asyncio as aioredis
-        _redis_pub_client = aioredis.Redis(host="localhost", port=6379, db=0)
+        # Capped — this fires on every broker tick (no consumer yet, see
+        # REDIS_TICK_CHANNEL above), and an uncapped pool lets a tick burst
+        # open far more concurrent connections than actually needed, which
+        # exhausts this process's file-descriptor limit. broadcast()'s
+        # try/except already treats a publish failure as a no-op, so a
+        # capped-out pool just skips that tick's publish instead of crashing.
+        _redis_pub_client = aioredis.Redis(host="localhost", port=6379, db=0, max_connections=20)
     return _redis_pub_client
 
 

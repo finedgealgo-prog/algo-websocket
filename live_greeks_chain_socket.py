@@ -276,6 +276,14 @@ def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
         'type':                  'chain',
         'instrument':            underlying,
         'expiry':                resolved_expiry,
+        # requested_expiry = the exact subscribe-key expiry this broadcaster task is
+        # registered under ('' for nearest, or whatever concrete date was asked for) — see
+        # delta_live_chain_socket.py's own _build_chain_payload for the full story on why
+        # this exists: without it, the frontend's onmessage handler could only guess which
+        # subscription a push belonged to from (instrument, resolved expiry) alone, which
+        # silently misroutes a concrete-expiry task's pushes into a same-instrument ''
+        # (nearest) subscriber too whenever both are watched at once.
+        'requested_expiry':      expiry,
         'expiries':              expiries,
         'spot_price':            spot_price,
         'pricing_spot':          spot_price,

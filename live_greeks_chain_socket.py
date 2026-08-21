@@ -206,18 +206,20 @@ def _resolve_previous_close(db, underlying: str) -> float:
     return resolved
 
 
-def _resolve_india_vix(db) -> float:
-    """"INDIAVIX"-tagged rows (current backfill) → legacy token-only NSE_00 rows."""
-    doc = (
-        db['option_chain_index_spot'].find_one(
-            {'underlying': 'INDIAVIX'}, {'_id': 0, 'close': 1, 'spot_price': 1}, sort=[('timestamp', -1)],
-        )
-        or db['option_chain_index_spot'].find_one(
-            {'token': 'NSE_00'}, {'_id': 0, 'close': 1, 'spot_price': 1}, sort=[('timestamp', -1)],
-        )
-        or {}
-    )
-    return round(float(doc.get('spot_price') or doc.get('close') or 0), 2)
+def _resolve_india_vix() -> float:
+    """Live India VIX LTP straight from this process's own broker WS feed.
+
+    algo.websocket owns the live broker connection, so the VIX tick is
+    already sitting in broker_ticker_manager.ltp_map in-memory — no need to
+    round-trip Mongo (that DB fallback was hitting option_chain_index_spot,
+    a backtest-history collection, on every chain broadcast).
+    """
+    try:
+        from features.broker_gateway import broker_ticker_manager as _btm, BROKER_VIX_TOKEN  # type: ignore
+        vix_ltp = float(_btm.ltp_map.get(str(BROKER_VIX_TOKEN), 0) or 0)
+    except Exception:
+        vix_ltp = 0.0
+    return round(vix_ltp, 2)
 
 
 def _resolve_lot_size(db, underlying: str, expiry: str) -> int:
@@ -262,7 +264,7 @@ def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
     previous_close = _resolve_previous_close(db._db, underlying)
     change_pct = round((spot_price - previous_close) / previous_close * 100, 2) if previous_close else 0.0
     change_points = round(spot_price - previous_close, 2) if previous_close else 0.0
-    india_vix = _resolve_india_vix(db._db)
+    india_vix = _resolve_india_vix()
     lot_size = _resolve_lot_size(db._db, underlying, resolved_expiry) if resolved_expiry else _LOT_SIZE_DEFAULTS.get(underlying, 75)
     atm_strike, strike_interval = _compute_atm_and_interval(chain, spot_price)
 

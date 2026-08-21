@@ -23,9 +23,6 @@ Endpoints
   POST /ticker/subscribe            aggregate token subscribe (new)
   POST /ticker/unsubscribe          aggregate token unsubscribe (new)
   POST /ticker/warm-chain           aggregate chain-warm request (new)
-  GET  /fno-stocks                  FNO stock list (new — same code as
-                                     algo.trade/algo.simulator, see
-                                     features/fno_stocks.py)
   GET  /algo/mtm/historical-data           \
   GET  /algo/spot/historical-data           } historical market data — same
   GET  /algo/option-chain/historical-iv     } code as algo.trade/algo.simulator,
@@ -54,9 +51,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from features.broker_gateway import broker_ticker_manager as ticker_manager
 from features.live_quote_socket import live_quote_socket_router
 from live_greeks_chain_socket import live_greeks_chain_socket_router, prewarm_chain_rest
-from fno_stocks import router as fno_stocks_router, _refresh_fno_cache
 from historical_data_router import router as historical_data_router
-from mcx_commodities import router as mcx_commodities_router
 from features.mongo_data import MongoData
 from features.market_hours_scheduler import run_market_hours_scheduler
 
@@ -73,10 +68,9 @@ app.include_router(live_quote_socket_router)
 app.include_router(live_greeks_chain_socket_router)
 # Canonical, ONLY home for the "price domain" REST surface — common/shared
 # endpoints live here exclusively, never duplicated into algo.trade/
-# algo.simulator/algo.scanner's own APIs (see shared/features/fno_stocks.py,
-# historical_data_router.py, mcx_commodities.py).
-app.include_router(fno_stocks_router)
-app.include_router(mcx_commodities_router)
+# algo.simulator's own APIs (see historical_data_router.py). fno-stocks and
+# mcx-commodities moved to algo.scanner (2026-08-20) — this process's event
+# loop also carries live tick delivery, which was adding latency to those.
 app.include_router(historical_data_router)
 
 # ── Internal tick hub ─────────────────────────────────────────────────────────
@@ -158,6 +152,8 @@ class _InternalTickHub:
                 "changed_oi_map":  tick_payload.get("changed_oi_map")  or {},
                 "changed_bid_map": tick_payload.get("changed_bid_map") or {},
                 "changed_ask_map": tick_payload.get("changed_ask_map") or {},
+                "changed_bid_qty_map": tick_payload.get("changed_bid_qty_map") or {},
+                "changed_ask_qty_map": tick_payload.get("changed_ask_qty_map") or {},
                 # now_ts comes from the broker ticker's timestamp field
                 "now_ts": (tick_payload.get("timestamp") or "")[:19],
             },
@@ -346,24 +342,6 @@ async def _auto_prewarm_chain_rest() -> None:
             log.info("[STARTUP] Chain REST prewarm started for %s", instruments)
         except Exception:
             log.exception("[STARTUP] Chain REST prewarm failed.")
-    asyncio.create_task(_bg())
-
-
-@app.on_event("startup")
-async def _auto_prewarm_fno_stocks() -> None:
-    """
-    Runs the /fno-stocks aggregation once at boot instead of on whichever
-    request happens to hit a cold (post-restart) cache — see
-    fno_stocks._refresh_fno_cache's docstring on why that cold path, run
-    inline on a request, is slow and blocks this process's shared event loop
-    (the same loop /ws/internal-ticks depends on).
-    """
-    async def _bg():
-        try:
-            stocks = await _refresh_fno_cache()
-            log.info("[STARTUP] FNO stocks cache prewarmed (%d symbols).", len(stocks))
-        except Exception:
-            log.exception("[STARTUP] FNO stocks prewarm failed.")
     asyncio.create_task(_bg())
 
 

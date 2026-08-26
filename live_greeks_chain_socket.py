@@ -396,6 +396,12 @@ class _GreeksChainHub:
                 task = self._tasks.pop(key, None)
                 if task:
                     task.cancel()
+                # Without this, _latest_payloads keeps one full chain
+                # snapshot per (underlying, expiry) ever watched, forever —
+                # expiries roll over weekly/monthly so this dict only ever
+                # grows, which was the root cause of algo-websocket's
+                # repeated OOM kills (RSS climbing to 4-8GB over ~5 days).
+                self._latest_payloads.pop(key, None)
 
     async def _send_immediate(self, key: tuple[str, str], ws: WebSocket) -> None:
         from features.mongo_data import MongoData  # type: ignore

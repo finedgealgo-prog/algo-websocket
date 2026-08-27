@@ -161,7 +161,11 @@ class _InternalTickHub:
 
         try:
             redis_client = await _get_redis_pub_client()
-            await redis_client.publish(REDIS_TICK_CHANNEL, msg)
+            # Bounded wait — an unreachable/slow Redis must never stall this coroutine
+            # past the next tick's arrival (see _tick_queue backpressure below: a stuck
+            # broadcast() is what let the queue pile up full ltp_map/spot_map copies
+            # until the process OOM'd).
+            await asyncio.wait_for(redis_client.publish(REDIS_TICK_CHANNEL, msg), timeout=0.2)
         except Exception as exc:
             # Never let a Redis hiccup break the existing local broadcast path below.
             log.debug("[InternalHub] redis publish skipped: %s", exc)
@@ -191,28 +195,56 @@ class _InternalTickHub:
 _internal_hub = _InternalTickHub()
 
 # ── Broker tick listener (thread → asyncio bridge) ────────────────────────────
+#
+# _on_broker_tick used to schedule _internal_hub.broadcast() straight onto the
+# event loop with asyncio.run_coroutine_threadsafe — fire-and-forget, one call
+# per tick, no backpressure. If broadcast() ever fell behind the tick rate
+# (e.g. a slow/unreachable Redis — see the publish timeout in broadcast()),
+# scheduled broadcast() coroutines piled up in the loop, each holding its own
+# copy of the tick payload, until the process OOM'd (observed: ~4.3GB RSS
+# within 15-20 minutes of live market ticks). This bounded queue caps how much
+# payload can be in flight at once — once full, the oldest pending tick is
+# dropped in favor of the newest, so a stalled consumer sheds load instead of
+# accumulating it.
+_TICK_QUEUE_MAXSIZE = 50
+_tick_queue: "asyncio.Queue[dict] | None" = None
+
+
+async def _tick_consumer_loop() -> None:
+    assert _tick_queue is not None
+    while True:
+        payload = await _tick_queue.get()
+        try:
+            await _internal_hub.broadcast(payload)
+        except Exception:
+            log.exception("[InternalHub] broadcast error")
 
 
 def _on_broker_tick(tick_payload: dict) -> None:
     """
     Registered as a tick listener on the broker ticker.
-    Runs in the broker's background thread — schedule the async broadcast
-    onto the FastAPI event loop without blocking the tick callback.
-
-    Previously short-circuited when no legacy internal-hub WS client was
-    connected — harmless when broadcast() only ever did local WS fanout, but
-    it also skipped the Redis publish below now that broadcast() does that
-    unconditionally (see REDIS_TICK_CHANNEL), which would make Redis-only
-    consumers (a future gateway process with no /ws/internal-ticks client at
-    all) never receive anything.
+    Runs in the broker's background thread — hand the payload to the FastAPI
+    event loop via the bounded queue above instead of blocking the tick
+    callback or scheduling unbounded work onto the loop.
     """
-    if _app_loop is None:
+    if _app_loop is None or _tick_queue is None:
         return
+
+    def _enqueue() -> None:
+        try:
+            _tick_queue.put_nowait(tick_payload)
+        except asyncio.QueueFull:
+            try:
+                _tick_queue.get_nowait()  # drop the oldest pending tick
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                _tick_queue.put_nowait(tick_payload)
+            except asyncio.QueueFull:
+                pass
+
     try:
-        asyncio.run_coroutine_threadsafe(
-            _internal_hub.broadcast(tick_payload),
-            _app_loop,
-        )
+        _app_loop.call_soon_threadsafe(_enqueue)
     except Exception as exc:
         log.warning("[InternalHub] broadcast schedule error: %s", exc)
 
@@ -238,9 +270,13 @@ def _start_ticker_bg() -> None:
 
 @app.on_event("startup")
 async def _capture_loop() -> None:
-    """Capture the running event loop for use in the tick listener thread bridge."""
-    global _app_loop
+    """Capture the running event loop for use in the tick listener thread bridge,
+    and start the bounded tick-broadcast queue + its single consumer task (see
+    _on_broker_tick above)."""
+    global _app_loop, _tick_queue
     _app_loop = asyncio.get_running_loop()
+    _tick_queue = asyncio.Queue(maxsize=_TICK_QUEUE_MAXSIZE)
+    asyncio.create_task(_tick_consumer_loop())
 
 
 # Phase 3 horizontal scale-out: a second (third, fourth, ...) ws_main

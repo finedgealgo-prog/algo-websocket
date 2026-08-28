@@ -53,39 +53,14 @@ PUSH_INTERVAL_SECONDS = 2.0   # matches live_option_chain.py's _CHAIN_TTL_SECOND
 
 # IV/Greeks are CPU-expensive (Black-Scholes bisection per contract, see
 # kite_delta_chain.py) and the frontend now computes its own display Greeks
-# (2026-08-26) — so this UI push only needs a fresh backend IV/Greeks solve
-# every GREEKS_REFRESH_INTERVAL_SECONDS, not on every PUSH_INTERVAL_SECONDS
-# tick. Between refreshes each row keeps the last value actually computed for
-# that contract (see _last_greeks_by_token below) instead of flashing to 0.
-GREEKS_REFRESH_INTERVAL_SECONDS = 30.0
-_last_greeks_refresh_at: dict[tuple[str, str], float] = {}
-# Never evicted, same as _latest_payloads used to be — but unlike that bug
-# (full chain snapshots, the actual OOM cause), each entry here is 5 floats
-# keyed by token, so even every contract token ever displayed across months
-# stays in the tens-of-MB range. Not worth a cleanup pass for that.
-_last_greeks_by_token: dict[str, dict] = {}
-
-
-def _apply_greeks_refresh_throttle(chain: dict, fresh: bool) -> None:
-    """Mutates `chain` rows in place: caches this push's greeks by token when
-    `fresh` (a real Black-Scholes solve just ran), or backfills each row's
-    iv/delta/gamma/theta/vega from the last cached solve for that token when
-    not (this push's fetch_full_chain call was compute_greeks=False, so every
-    row already came back zeroed)."""
-    for side in ('CE', 'PE'):
-        for row in chain.get(side) or []:
-            tok = row.get('token')
-            if not tok:
-                continue
-            if fresh:
-                _last_greeks_by_token[tok] = {
-                    'iv': row.get('iv'), 'delta': row.get('delta'),
-                    'gamma': row.get('gamma'), 'theta': row.get('theta'), 'vega': row.get('vega'),
-                }
-            else:
-                cached = _last_greeks_by_token.get(tok)
-                if cached:
-                    row.update(cached)
+# entirely client-side from ltp/spot/strike/expiry (2026-08-28) — so this UI
+# chain no longer solves Black-Scholes on the backend at all;
+# fetch_full_chain is always called with compute_greeks=False below and every
+# row's iv/delta/gamma/theta/vega comes back zeroed. Real (non-display)
+# Greeks are still computed backend-side wherever an actual trading decision
+# needs them — see execution_socket.py / live_event.py / contracts.py and
+# algo.scanner's historical chain snapshot, none of which go through this
+# file.
 
 # Strikes kept each side of ATM per CE/PE for the live UI chain. fetch_full_
 # chain's strike_window param exists exactly for this (see its docstring) —
@@ -293,18 +268,10 @@ def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
     resolved_expiry = expiry or (expiries[0] if expiries else '')
     spot_price = _resolve_spot_price(db._db, underlying, resolved_expiry)
 
-    greeks_key = (underlying, resolved_expiry)
-    now = time.monotonic()
-    want_fresh_greeks = (now - _last_greeks_refresh_at.get(greeks_key, 0.0)) >= GREEKS_REFRESH_INTERVAL_SECONDS
-
     chain = (
-        fetch_full_chain(db, underlying, resolved_expiry, spot_price, strike_window=UI_CHAIN_STRIKE_WINDOW, compute_greeks=want_fresh_greeks)
+        fetch_full_chain(db, underlying, resolved_expiry, spot_price, strike_window=UI_CHAIN_STRIKE_WINDOW, compute_greeks=False)
         if resolved_expiry else {'CE': [], 'PE': []}
     )
-    if resolved_expiry:
-        if want_fresh_greeks:
-            _last_greeks_refresh_at[greeks_key] = now
-        _apply_greeks_refresh_throttle(chain, want_fresh_greeks)
 
     previous_close = _resolve_previous_close(db._db, underlying)
     change_pct = round((spot_price - previous_close) / previous_close * 100, 2) if previous_close else 0.0

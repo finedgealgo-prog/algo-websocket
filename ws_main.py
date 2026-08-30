@@ -53,7 +53,7 @@ from features.live_quote_socket import live_quote_socket_router
 from live_greeks_chain_socket import live_greeks_chain_socket_router, prewarm_chain_rest
 from historical_data_router import router as historical_data_router
 from features.mongo_data import MongoData
-from features.market_hours_scheduler import run_market_hours_scheduler
+from features.market_hours_scheduler import is_market_hours_now, run_market_hours_scheduler
 
 log = logging.getLogger(__name__)
 
@@ -309,6 +309,13 @@ async def _auto_start_ticker() -> None:
     async def _bg():
         await asyncio.sleep(2)
         try:
+            if not is_market_hours_now():
+                log.info(
+                    "[STARTUP] Broker ticker auto-start skipped — market closed right now; "
+                    "the weekday ~09:10 schedule below brings it up at the next real open. "
+                    "Manual /ticker/restart still works anytime."
+                )
+                return
             if ticker_manager.status not in ("running", "connecting"):
                 threading.Thread(target=_start_ticker_bg, daemon=True).start()
                 log.info("[STARTUP] Broker ticker auto-started.")

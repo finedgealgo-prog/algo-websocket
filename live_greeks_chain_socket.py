@@ -259,7 +259,7 @@ def _compute_atm_and_interval(chain: dict, spot_price: float) -> tuple[float, fl
     return atm_strike, strike_interval
 
 
-def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
+def _build_chain_payload(db, underlying: str, expiry: str, strike_window: int = UI_CHAIN_STRIKE_WINDOW) -> dict:
     from features.live_option_chain import fetch_full_chain  # type: ignore
     from features.broker_gateway import get_active_broker_token_status  # type: ignore
 
@@ -269,7 +269,7 @@ def _build_chain_payload(db, underlying: str, expiry: str) -> dict:
     spot_price = _resolve_spot_price(db._db, underlying, resolved_expiry)
 
     chain = (
-        fetch_full_chain(db, underlying, resolved_expiry, spot_price, strike_window=UI_CHAIN_STRIKE_WINDOW, compute_greeks=False)
+        fetch_full_chain(db, underlying, resolved_expiry, spot_price, strike_window=strike_window, compute_greeks=False)
         if resolved_expiry else {'CE': [], 'PE': []}
     )
 
@@ -548,6 +548,7 @@ async def live_greeks_chain_socket_multi(websocket: WebSocket) -> None:
 async def live_greeks_chain_rest(
     instrument: str,
     expiry: str = Query(default=''),
+    strike_window: int = Query(default=UI_CHAIN_STRIKE_WINDOW),
 ) -> dict:
     """
     One-shot REST snapshot — same payload shape as the WS push above (see
@@ -556,6 +557,14 @@ async def live_greeks_chain_rest(
     subscription. Replaces the old algo.trade-only /live-greeks-chain route
     — common/shared market data lives only here (algo.websocket), never
     duplicated into algo.trade/algo.simulator/algo.scanner's own APIs.
+
+    strike_window defaults to UI_CHAIN_STRIKE_WINDOW (unwindowed, matching
+    the WS push) so default callers are unaffected. A caller that narrows it
+    (e.g. live_option_chain_collector.py's per-minute snapshot, which only
+    needs the liquid ATM±30 range) bypasses the shared WS-hub cache below
+    entirely — that cache is keyed by (underlying, expiry) only, so a
+    windowed payload written into it would get served straight to a live
+    browser chain view expecting the full unwindowed chain.
     """
     from features.mongo_data import MongoData  # type: ignore
 
@@ -563,14 +572,17 @@ async def live_greeks_chain_rest(
     if not underlying:
         raise HTTPException(status_code=400, detail='Instrument is required.')
     key = (underlying, str(expiry or '').strip())
-    cached = _hub.get_cached_payload(key)
-    if cached is not None:
-        return cached
+    uses_shared_cache = strike_window == UI_CHAIN_STRIKE_WINDOW
+    if uses_shared_cache:
+        cached = _hub.get_cached_payload(key)
+        if cached is not None:
+            return cached
 
     db = MongoData()
     try:
-        payload = await asyncio.to_thread(_build_chain_payload, db, underlying, str(expiry or '').strip())
-        _hub._latest_payloads[key] = (time.monotonic(), payload)
+        payload = await asyncio.to_thread(_build_chain_payload, db, underlying, str(expiry or '').strip(), strike_window)
+        if uses_shared_cache:
+            _hub._latest_payloads[key] = (time.monotonic(), payload)
         return payload
     finally:
         db.close()

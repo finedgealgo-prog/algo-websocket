@@ -154,8 +154,11 @@ class _InternalTickHub:
                 "changed_ask_map": tick_payload.get("changed_ask_map") or {},
                 "changed_bid_qty_map": tick_payload.get("changed_bid_qty_map") or {},
                 "changed_ask_qty_map": tick_payload.get("changed_ask_qty_map") or {},
-                # now_ts comes from the broker ticker's timestamp field
-                "now_ts": (tick_payload.get("timestamp") or "")[:19],
+                # now_ts comes from the broker ticker's timestamp field — kept
+                # whole (not [:19]-truncated), which used to silently drop the
+                # trailing UTC 'Z' marker once dhan_ticker.py/kite_ticker.py
+                # started stamping one.
+                "now_ts": tick_payload.get("timestamp") or "",
             },
         })
 

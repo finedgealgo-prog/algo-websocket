@@ -351,6 +351,26 @@ async def _start_ticker_market_hours_schedule() -> None:
     ))
 
 
+@app.on_event("shutdown")
+async def _stop_ticker_on_shutdown() -> None:
+    """
+    Without this, stopping the process (Ctrl+C / systemd stop / --reload
+    restart) left the broker WS thread running with nothing telling it to
+    stop: the event loop closes first, then every tick still arriving from
+    that thread calls _on_broker_tick → call_soon_threadsafe on the now-closed
+    loop, which raises and gets logged as "[InternalHub] broadcast schedule
+    error: Event loop is closed" — once per tick, in a tight flood — until
+    the daemon thread itself finally dies with the process. Stopping the
+    ticker (or the CentralTickClient, in WS_GATEWAY_ONLY mode) here closes
+    that thread's WS connection synchronously before the loop goes away, so
+    it stops producing ticks instead of racing shutdown.
+    """
+    try:
+        await asyncio.to_thread(ticker_manager.stop)
+    except Exception:
+        log.exception("[SHUTDOWN] ticker stop error")
+
+
 @app.on_event("startup")
 async def _auto_prewarm_chain_rest() -> None:
     """
